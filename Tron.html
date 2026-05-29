@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>P2P Tron (Upgraded)</title>
+    <script src="https://unpkg.com/peerjs@1.5.1/dist/peerjs.min.js"></script>
+    <style>
+        body { background: #030308; color: #00ffcc; font-family: monospace; margin: 0; overflow: hidden; }
+        #ui { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.9); padding: 20px; border: 2px solid #00ffcc; z-index: 10; box-shadow: 0 0 15px #00ffcc; }
+        canvas { display: block; }
+        button, input, select { background: #030308; color: #00ffcc; border: 1px solid #00ffcc; padding: 6px 12px; font-family: monospace; cursor: pointer; font-size: 14px; margin-bottom: 8px; }
+        label { display: block; font-size: 11px; color: #ff0055; margin-bottom: 4px; }
+        .code-display { font-size: 24px; font-weight: bold; color: #ffffff; letter-spacing: 2px; background: #111; padding: 5px; text-align: center; margin: 10px 0; border: 1px dashed #fff; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div id="menu">
+            <label>SELECT GAME MODE</label>
+            <select id="gameMode">
+                <option value="classic">Classic (Normal)</option>
+                <option value="hyper">Hyper (Fast!)</option>
+                <option value="gridlock">Gridlock (Obstacles)</option>
+            </select>
+            <br>
+            <button onclick="hostGame()">Host Room</button>
+            <hr style="border-color:#00ffcc; margin: 15px 0;">
+            <input id="joinId" placeholder="4-LETTER CODE" style="text-transform: uppercase;" maxlength="4">
+            <button onclick="joinGame()">Join Room</button>
+        </div>
+        <div id="status" style="display:none;"></div>
+    </div>
+    <canvas id="gameCanvas"></canvas>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+window.addEventListener('resize', resize); resize();
+
+let peer = null;
+let conn;
+let isHost = false;
+let gameSpeed = 8;
+const MAP_SIZE = 1600;
+
+let gameState = {
+    p1: { x: 200, y: 800, dir: 'RIGHT', color: '#ff0055', history: [], alive: true },
+    p2: { x: 1400, y: 800, dir: 'LEFT', color: '#00bfff', history: [], alive: true },
+    obstacles: [],
+    mode: 'classic',
+    roundOver: false,
+    countdown: 0
+};
+
+// Generates short randomized Alphanumeric codes
+function generateRoomCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Omitted ambiguous characters (0, I, O, 1)
+    let result = '';
+    for (let i = 0; i < 4; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+    return result;
+}
+
+function initRound(modeSelection) {
+    gameState.mode = modeSelection || gameState.mode;
+    gameSpeed = gameState.mode === 'hyper' ? 16 : 8;
+
+    gameState.p1 = { x: 200, y: 800, dir: 'RIGHT', color: '#ff0055', history: [{x: 200, y: 800}], alive: true };
+    gameState.p2 = { x: 1400, y: 800, dir: 'LEFT', color: '#00bfff', history: [{x: 1400, y: 800}], alive: true };
+    gameState.roundOver = false;
+    gameState.countdown = 0;
+
+    // Build unique obstacle set for Gridlock mode
+    if (gameState.mode === 'gridlock' && isHost) {
+        gameState.obstacles = []
+        for (let i = 0; i < 16; i++) {
+            let ox = Math.floor(Math.random() * (MAP_SIZE / 32 - 4) + 2) * 32;
+            let oy = Math.floor(Math.random() * (MAP_SIZE / 32 - 4) + 2) * 32;
+            // Prevent spawning barriers right on starting positions
+            if (Math.abs(oy - 800) > 100) gameState.obstacles.push({x: ox, y: oy, w: 32, h: 32});
+            else i--;
+        }
+    } else if (isHost) {
+        gameState.obstacles = [];
+    }
+}
+
+function hostGame() {
+    isHost = true;
+    const selectedMode = document.getElementById('gameMode').value;
+    document.getElementById('menu').style.display = 'none';
+    const statusEl = document.getElementById('status');
+    statusEl.style.display = 'block';
+    statusEl.innerText = 'Generating Room...';
+
+    const roomCode = generateRoomCode();
+    // Prepend namespace to maintain a clean public signaling key namespace
+    peer = new Peer('tron-room-' + roomCode);
+
+    peer.on('open', () => {
+        statusEl.innerHTML = 'SHARE THIS 4-LETTER CODE:<div class="code-display">' + roomCode + '</div>Waiting for opponent to join...';
+    });
+
+    peer.on('error', err => {
+        console.error(err);
+        statusEl.innerText = 'Room allocation failed. Retrying...';
+        setTimeout(hostGame, 1000);
+    });
+
+    peer.on('connection', c => {
+        conn = c;
+        statusEl.style.display = 'none';
+        initRound(selectedMode);
+        setupHostLogic();
+    });
+}
+
+function joinGame() {
+    let inputCode = document.getElementById('joinId').value.trim().toUpperCase();
+    if (inputCode.length !== 4) return alert('Enter a valid 4-letter code');
+
+    document.getElementById('menu').style.display = 'none';
+    const statusEl = document.getElementById('status');
+    statusEl.style.display = 'block';
+    statusEl.innerText = 'Connecting to room ' + inputCode + '...';
+
+    peer = new Peer();
+    peer.on('open', () => {
+        conn = peer.connect('tron-room-' + inputCode);
+        conn.on('open', () => {
+            statusEl.style.display = 'none';
+            conn.on('data', data => {
+                if (data.type === 'gameState') {
+                    gameState = data.state;
+                    gameSpeed = gameState.mode === 'hyper' ? 16 : 8;
+                    render();
+                }
+            });
+        });
+    });
+}
+
+window.addEventListener('keydown', e => {
+    if (!conn || gameState.roundOver) return;
+    let newDir = null;
+    const p = isHost ? gameState.p1 : gameState.p2;
+    switch (e.key.toLowerCase()) {
+        case 'w': case 'arrowup': if (p.dir !== 'DOWN') newDir = 'UP'; break;
+        case 's': case 'arrowdown': if (p.dir !== 'UP') newDir = 'DOWN'; break;
+        case 'a': case 'arrowleft': if (p.dir !== 'RIGHT') newDir = 'LEFT'; break;
+        case 'd': case 'arrowright': if (p.dir !== 'LEFT') newDir = 'RIGHT'; break;
+    }
+    if (newDir && gameState.p1.alive && gameState.p2.alive) {
+        if (isHost) {
+            gameState.p1.history.push({ x: gameState.p1.x, y: gameState.p1.y });
+            gameState.p1.dir = newDir;
+        } else {
+            conn.send({ type: 'input', dir: newDir });
+        }
+    }
+});
+
+function setupHostLogic() {
+    conn.on('data', data => {
+        if (data.type === 'input' && !gameState.roundOver) {
+            const p2 = gameState.p2;
+            if ((data.dir === 'UP' && p2.dir !== 'DOWN') ||
+                (data.dir === 'DOWN' && p2.dir !== 'UP') ||
+                (data.dir === 'LEFT' && p2.dir !== 'RIGHT') ||
+                (data.dir === 'RIGHT' && p2.dir !== 'LEFT')) {
+                gameState.p2.history.push({ x: p2.x, y: p2.y });
+                gameState.p2.dir = data.dir;
+            }
+        }
+    });
+
+    setInterval(() => {
+        if (gameState.roundOver) return;
+
+        updatePlayer(gameState.p1);
+        updatePlayer(gameState.p2);
+
+        if (gameState.p1.x <= 0 || gameState.p1.x >= MAP_SIZE || gameState.p1.y <= 0 || gameState.p1.y >= MAP_SIZE) gameState.p1.alive = false;
+        if (gameState.p2.x <= 0 || gameState.p2.x >= MAP_SIZE || gameState.p2.y <= 0 || gameState.p2.y >= MAP_SIZE) gameState.p2.alive = false;
+
+        if (gameState.p1.alive && (checkTrailCollision(gameState.p1, gameState.p1, true) || checkTrailCollision(gameState.p1, gameState.p2, false) || checkObstacles(gameState.p1))) gameState.p1.alive = false;
+        if (gameState.p2.alive && (checkTrailCollision(gameState.p2, gameState.p2, true) || checkTrailCollision(gameState.p2, gameState.p1, false) || checkObstacles(gameState.p2))) gameState.p2.alive = false;
+
+        // Auto-Restart Trigger Block
+        if (!gameState.p1.alive || !gameState.p2.alive) {
+            gameState.roundOver = true;
+            gameState.countdown = 3;
+            let timer = setInterval(() => {
+                gameState.countdown--;
+                if (gameState.countdown < 0) {
+                    clearInterval(timer);
+                    initRound(); // Resets layout tracking
+                }
+                conn.send({ type: 'gameState', state: gameState });
+                render();
+            }, 1000);
+        }
+
+        conn.send({ type: 'gameState', state: gameState });
+        render();
+    }, 1000 / 30);
+}
+
+function updatePlayer(p) {
+    if (!p.alive) return;
+    if (p.dir === 'UP') p.y -= gameSpeed;
+    if (p.dir === 'DOWN') p.y += gameSpeed;
+    if (p.dir === 'LEFT') p.x -= gameSpeed;
+    if (p.dir === 'RIGHT') p.x += gameSpeed;
+    if (p.history.length > 100) p.history.shift();
+    
+}
+
+function isPointOnSegment(px, py, x1, y1, x2, y2) {
+    if (x1 === x2) {
+        return px === x1 && py >= Math.min(y1, y2) && py <= Math.max(y1, y2);
+    } else if (y1 === y2) {
+        return py === y1 && px >= Math.min(x1, x2) && px <= Math.max(x1, x2);
+    }
+    return false;
+}
+
+function checkTrailCollision(p, targetPlayer, isSelf) {
+    const history = targetPlayer.history;
+    for (let i = 0; i < history.length - 1; i++) {
+        if (isPointOnSegment(p.x, p.y, history[i].x, history[i].y, history[i+1].x, history[i+1].y)) return true;
+    }
+    if (!isSelf) {
+        const lastPt = history[history.length - 1];
+        if (lastPt && isPointOnSegment(p.x, p.y, lastPt.x, lastPt.y, targetPlayer.x, targetPlayer.y)) return true;
+    }
+    return false;
+}
+
+function checkObstacles(p) {
+    for (let obs of gameState.obstacles) {
+        if (p.x >= obs.x && p.x <= obs.x + obs.w && p.y >= obs.y && p.y <= obs.y + obs.h ) return true;
+    }
+    return false;
+}
+
+function render() {
+    ctx.fillStyle = '#030308';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    let cameraTarget = isHost ? gameState.p1 : gameState.p2;
+    ctx.save();
+    ctx.translate(canvas.width / 2 - cameraTarget.x, canvas.height / 2 - cameraTarget.y);
+
+    ctx.strokeStyle = '#1a1a2e';
+    ctx.lineWidth = 8;
+    ctx.strokeRect(0, 0, MAP_SIZE, MAP_SIZE);
+
+    // Render obstacles if running in Gridlock mode
+    ctx.fillStyle = '#331a4c';
+    gameState.obstacles.forEach(obs => {
+        ctx.fillRect(obs.x, obs.y, obs.w, obs.h);
+        ctx.strokeStyle = '#b300ff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(obs.x, obs.y, obs.w, obs.h);
+    });
+
+    [gameState.p1, gameState.p2].forEach(p => {
+        ctx.strokeStyle = p.color;
+        ctx.lineWidth = 6;
+        ctx.beginPath();
+        if (p.history.length > 0) {
+            ctx.moveTo(p.history[0].x, p.history[0].y);
+            p.history.forEach(pt => ctx.lineTo(pt.x, pt.y));
+            ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+        if (p.alive) {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(p.x - 4, p.y - 4, 8, 8);
+        }
+    });
+    ctx.restore();
+
+    if (gameState.roundOver) {
+        ctx.fillStyle = 'rgba(3, 3, 8, 0.85)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#00ffcc';
+        ctx.font = 'bold 40px monospace';
+        ctx.textAlign = 'center';
+
+        let msg = "MUTUAL CRASH / TIE!";
+        if (gameState.p1.alive && !gameState.p2.alive) msg = "PLAYER 1 (HOST) WINS!";
+        if (!gameState.p1.alive && gameState.p2.alive) msg = "PLAYER 2 (GUEST) WINS!";
+
+        ctx.fillText(msg, canvas.width / 2, canvas.height / 2 - 30);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '24px monospace';
+        ctx.fillText("RESTARTING IN " + gameState.countdown + "...", canvas.width / 2, canvas.height / 2 + 30);
+    }
+}
+</script>
+</body>
+</html>
